@@ -6,6 +6,8 @@
 
 ## Architecture Overview
 
+![Architecture Overview](docs/architecture/architecture-overview.svg)
+
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                  OKD SNO — Management Cluster                       │
