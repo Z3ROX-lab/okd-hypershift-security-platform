@@ -55,8 +55,6 @@ root-app         Synced        Healthy
 
 ### 1.2 Azure Cost Management — Budget alert configured
 
-![Azure Budget Alert](screenshots/phase1/03-azure-budget-alert.png)
-
 Budget `ai-platform-budget` at $50/month active on the Azure subscription. This ensures no unexpected costs from Azure Spot workers.
 
 ### 1.3 HyperShift CLI installation
