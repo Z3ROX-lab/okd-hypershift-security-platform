@@ -1,0 +1,64 @@
+# =============================================================================
+# hosted-cluster.yaml — HostedCluster CR HyperShift Azure
+# Repo : okd-hypershift-security-platform
+# Namespace : clusters
+# =============================================================================
+apiVersion: hypershift.openshift.io/v1beta1
+kind: HostedCluster
+metadata:
+  name: okd-azure-nodepools
+  namespace: clusters
+  annotations:
+    hypershift.openshift.io/skip-release-image-validation: "true"
+spec:
+  release:
+    image: "quay.io/openshift/okd:4.15.0-0.okd-2024-03-10-010116"
+
+  platform:
+    type: Azure
+    azure:
+      credentials:
+        name: azure-credentials    # ExternalSecret → Vault secret/hypershift/azure
+      location: westeurope
+      resourceGroupName: rg-hypershift-okd-azure-nodepools
+      subscriptionID: ba0b95a5-9b7c-42f1-9be5-60693af5e24f
+      tenantID: 50f175e8-570e-41d1-9759-735e9ad3a14e
+      vnetName: vnet-hypershift
+      subnetName: subnet-workers
+      securityGroupName: nsg-hypershift-workers
+      machineIdentityID: ""        # à remplir après création du SP managed identity si nécessaire
+
+  dns:
+    baseDomain: sno.okd.lab
+    publicZoneID: ""
+    privateZoneID: ""
+
+  networking:
+    clusterNetwork:
+      - cidr: 10.132.0.0/14
+    serviceNetwork:
+      - cidr: 172.31.0.0/16
+    machineNetwork:
+      - cidr: 10.0.0.0/16          # CIDR du subnet Azure workers
+    networkType: OVNKubernetes
+
+  pullSecret:
+    name: pull-secret              # Secret avec pull secret OKD (peut être fake pour OKD)
+
+  sshKey:
+    name: ssh-key                  # Secret avec clé publique SSH pour les workers
+
+  infraID: okd-azure-nodepools
+
+  etcd:
+    managed:
+      storage:
+        persistentVolume:
+          size: 8Gi
+        type: PersistentVolume
+    managementType: Managed
+
+  controllerAvailabilityPolicy: SingleReplica
+  infrastructureAvailabilityPolicy: SingleReplica
+
+  autoscaling: {}

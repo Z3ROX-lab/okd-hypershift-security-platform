@@ -1,0 +1,90 @@
+# =============================================================================
+# nodepool.yaml — NodePool CR HyperShift Azure
+# 1 worker Standard_D4s_v3 Spot westeurope
+# Tailscale installé via ignition userdata
+# =============================================================================
+apiVersion: hypershift.openshift.io/v1beta1
+kind: NodePool
+metadata:
+  name: okd-azure-nodepools
+  namespace: clusters
+spec:
+  clusterName: okd-azure-nodepools
+  replicas: 1
+
+  platform:
+    type: Azure
+    azure:
+      vmsize: Standard_D4s_v3
+      osDisk:
+        sizeGB: 120
+        storageAccountType: Premium_LRS
+      # Spot instances — économie 70-80% vs prix normal
+      spotVMOptions: {}
+
+  release:
+    image: "quay.io/openshift/okd:4.15.0-0.okd-2024-03-10-010116"
+
+  management:
+    autoRepair: false
+    upgradeType: Replace
+
+  # Tailscale via ignition config au démarrage du worker
+  config:
+    items:
+      - apiVersion: machineconfiguration.openshift.io/v1
+        kind: MachineConfig
+        metadata:
+          name: tailscale-worker-config
+        spec:
+          config:
+            ignition:
+              version: 3.2.0
+            storage:
+              files:
+                # Script d'installation Tailscale
+                - path: /usr/local/bin/install-tailscale.sh
+                  mode: 0755
+                  contents:
+                    source: |
+                      #!/bin/bash
+                      set -euo pipefail
+
+                      # Installer Tailscale
+                      curl -fsSL https://tailscale.com/install.sh | sh
+
+                      # Récupérer l'auth key depuis le fichier monté
+                      AUTH_KEY=$(cat /etc/tailscale/auth-key 2>/dev/null || echo "")
+                      if [ -z "$AUTH_KEY" ]; then
+                        echo "ERROR: Tailscale auth key not found"
+                        exit 1
+                      fi
+
+                      # Activer Tailscale
+                      tailscale up \
+                        --authkey="${AUTH_KEY}" \
+                        --hostname="okd-worker-$(hostname -s)" \
+                        --accept-routes \
+                        --accept-dns=false
+
+                      echo "Tailscale up — $(tailscale ip -4)"
+
+            systemd:
+              units:
+                - name: tailscale-install.service
+                  enabled: true
+                  contents: |
+                    [Unit]
+                    Description=Install and configure Tailscale
+                    After=network-online.target
+                    Wants=network-online.target
+                    ConditionPathExists=!/var/lib/tailscale-installed
+
+                    [Service]
+                    Type=oneshot
+                    RemainAfterExit=yes
+                    ExecStart=/usr/local/bin/install-tailscale.sh
+                    ExecStartPost=/bin/touch /var/lib/tailscale-installed
+
+                    [Install]
+                    WantedBy=multi-user.target
