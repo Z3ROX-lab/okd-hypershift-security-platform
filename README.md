@@ -128,8 +128,8 @@ Azure Worker                 Tailscale Network            OKD SNO
 | Grafana + Loki | Observability stack | ✅ Deployed |
 | Kyverno | Policy engine — admission control | ✅ Deployed |
 | GitHub Actions Runner | Self-hosted CI on OKD | ✅ Deployed |
-| HyperShift Operator | Hosted Control Planes manager | 🔜 Phase 1 |
-| Tailscale Subnet Router | Secure tunnel to Azure workers | 🔜 Phase 2 |
+| HyperShift Operator | Hosted Control Planes manager | ✅ Phase 1 |
+| Tailscale Subnet Router | Secure tunnel to Azure workers | ✅ Phase 2 |
 
 ### Harbor VM — 192.168.241.20
 
@@ -143,37 +143,39 @@ Azure Worker                 Tailscale Network            OKD SNO
 
 ## Project Phases
 
-### Phase 1 — HyperShift Operator Installation
-- Install HyperShift CLI compatible with OKD 4.15
-- Deploy HyperShift Operator on OKD SNO via ArgoCD
-- Validate operator pods and CRDs (`HostedCluster`, `NodePool`)
+### ✅ Phase 1 — HyperShift Operator Installation
+- HyperShift CLI installed from `quay.io/hypershift/hypershift-operator:latest`
+- CRDs patched for Kubernetes 1.28 compatibility (CEL `isIP()` removed)
+- Applied via `--server-side` to bypass 262144 bytes annotation limit
+- Operator running with 2 replicas in namespace `hypershift`
 
-### Phase 2 — Tailscale Network Setup
-- Deploy Tailscale Subnet Router on `sno-master`
-- Configure Tailscale auth key for Azure workers bootstrap
-- Validate network path between SNO and Azure region
+### ✅ Phase 2 — Tailscale Zero Trust Network
+- Tailscale DaemonSet deployed on `sno-master` (privileged, hostNetwork)
+- Dedicated ServiceAccount + RBAC + SCC `privileged`
+- `sno-master` connected to tailnet: `100.68.211.56`
+- Subnet `192.168.241.0/24` advertised and approved
+- DERP relay: Frankfurt (fra)
 
-### Phase 3 — Azure HostedCluster Creation
+### 🔜 Phase 3 — Azure HostedCluster Creation
 - Create Azure Service Principal with scoped permissions
-- Deploy `HostedCluster` CR and `NodePool` CR via ArgoCD
+- Deploy `HostedCluster` CR and `NodePool` CR
 - Monitor CAPI provisioning and worker bootstrap
-- Validate node registration and cluster health
+- Validate node registration via Tailscale mTLS
 
-### Phase 4 — Supply Chain Security
+### 🔜 Phase 4 — Supply Chain Security
 - Configure Harbor as pull-through cache for Hosted Cluster images
 - Enforce Cosign signature verification via Kyverno policies on the Hosted Cluster
 - Integrate Trivy scanning in the GitHub Actions CI pipeline
 
-### Phase 5 — Observability & IAM
+### 🔜 Phase 5 — Observability & IAM
 - Extend Prometheus/Grafana to scrape Hosted Cluster metrics
 - Federate Loki logs from Azure workers to OKD SNO Loki
 - Configure Keycloak OIDC for Hosted Cluster API authentication
 - Integrate Vault for Hosted Cluster secrets
 
-### Phase 6 — Documentation & Security Posture
+### 🔜 Phase 6 — Documentation & Security Posture
 - Architecture Decision Records (ADRs) for each design choice
 - `SECURITY.md` covering IAM, supply chain, network, runtime, secrets
-- Architecture diagrams and screenshot-based demo walkthrough
 - Threat model: attack surface analysis (HCP pods ↔ Azure workers link)
 
 ---
@@ -184,22 +186,42 @@ Azure Worker                 Tailscale Network            OKD SNO
 okd-hypershift-security-platform/
 ├── argocd/
 │   └── applications/
-│       ├── hypershift.yaml
-│       └── tailscale.yaml
 ├── manifests/
 │   ├── hypershift/
-│   │   ├── hostedcluster.yaml
-│   │   └── nodepool.yaml
+│   │   └── hypershift-install-patched.yaml
 │   └── tailscale/
-│       └── subnet-router.yaml
+│       └── daemonset-sno.yaml
 ├── docs/
 │   ├── architecture/
-│   │   ├── overview.md
-│   │   └── adr/
-│   └── phases/
+│   │   └── architecture-overview.svg
+│   ├── demo/
+│   │   ├── DEMO.md
+│   │   └── screenshots/
+│   │       ├── architecture-overview.png
+│   │       ├── phase1/
+│   │       └── phase2/
+│   └── adr/
 ├── SECURITY.md
 └── README.md
 ```
+
+---
+
+## Demo Walkthrough
+
+A full step-by-step demo with screenshots is available in [`docs/demo/DEMO.md`](docs/demo/DEMO.md).
+
+---
+
+## Key Technical Challenges & Solutions
+
+| Challenge | Solution |
+|---|---|
+| HyperShift CEL `isIP()` incompatible with k8s 1.28 | Python script to patch CRDs before apply |
+| CRD too large for client-side apply (>262144 bytes) | `--server-side --force-conflicts` apply |
+| MCE not available on OKD (Red Hat subscription required) | HyperShift standalone operator via CLI |
+| Tailscale DNS resolution fails with `hostNetwork: true` | `dnsPolicy: ClusterFirstWithHostNet` |
+| Tailscale pod rejected by OKD PodSecurity | Dedicated ServiceAccount + SCC `privileged` |
 
 ---
 
