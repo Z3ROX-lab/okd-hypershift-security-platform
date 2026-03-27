@@ -1,11 +1,6 @@
 # =============================================================================
 # hosted-cluster.yaml — HostedCluster CR HyperShift Azure
-# Repo : okd-hypershift-security-platform
-# Namespace : clusters
-# Infrastructure Azure provisionnée via Terraform (infra/azure/)
-#
-# ⚠️  Ne pas appliquer directement — utiliser deploy.sh
-#     qui injecte les variables depuis Vault/ESO
+# ⚠️  Ne pas appliquer directement — utiliser scripts/deploy-hostedcluster.sh
 # =============================================================================
 apiVersion: hypershift.openshift.io/v1beta1
 kind: HostedCluster
@@ -22,6 +17,7 @@ spec:
     type: Azure
     azure:
       azureAuthenticationConfig:
+        azureAuthenticationConfigType: ManagedIdentity
         armDNSPrefix: okd-azure-nodepools
         cloud: AzurePublicCloud
         credentialsSecretRef:
@@ -46,6 +42,24 @@ spec:
     machineNetwork:
       - cidr: 10.0.0.0/16
     networkType: OVNKubernetes
+
+  # Services exposés par le Hosted Control Plane
+  services:
+    - service: APIServer
+      servicePublishingStrategy:
+        type: LoadBalancer
+    - service: OAuthServer
+      servicePublishingStrategy:
+        type: Route
+    - service: Konnectivity
+      servicePublishingStrategy:
+        type: Route
+    - service: Ignition
+      servicePublishingStrategy:
+        type: Route
+    - service: OVNSbDb
+      servicePublishingStrategy:
+        type: Route
 
   pullSecret:
     name: pull-secret
