@@ -51,7 +51,7 @@ kyverno          Synced        Healthy
 root-app         Synced        Healthy
 ```
 
-![ArgoCD Applications](screenshots/phase1/01-argocd-apps-healthy.png)
+![ArgoCD Applications](screenshots/phase1-argocd-apps-healthy.png)
 
 ### 1.2 Azure Cost Management — Budget alert configured
 
@@ -100,7 +100,7 @@ operator-86c64f5d44-f7lgc   1/1     Running   1          31m
 operator-86c64f5d44-mpksk   1/1     Running   0          31m
 ```
 
-![HyperShift Operator Running](screenshots/phase1/02-hypershift-operator-running.png)
+![HyperShift Operator Running](screenshots/phase1-hypershift-operator-running.png)
 
 ### 1.6 HyperShift CRDs registered
 
@@ -112,7 +112,7 @@ nodepools.hypershift.openshift.io
 ...
 ```
 
-![HyperShift CRDs](screenshots/phase1/04-hypershift-crds.png)
+![HyperShift CRDs](screenshots/phase1-hypershift-crds.png)
 
 ---
 
@@ -157,7 +157,7 @@ NAME              READY   STATUS    RESTARTS   AGE
 tailscale-ktjhs   1/1     Running   0          2d
 ```
 
-![Tailscale Pod Running](screenshots/phase2/03-tailscale-pod-running.png)
+![Tailscale Pod Running](screenshots/phase2-tailscale-pod-running.png)
 
 ### 2.4 sno-master connected to Tailscale network
 
@@ -219,7 +219,7 @@ grafana-operator   grafana-prometheus-token   SecretSynced   True
 keycloak           keycloak-secrets           SecretSynced   True
 ```
 
-![ESO SecretStores Ready](screenshots/phase2b/01-eso-secretstores-ready.png)
+![ESO SecretStores Ready](screenshots/phase2b-eso-secretstores-ready.png)
 
 ### 2b.4 ClusterSecretStore — cross-namespace for HyperShift
 
@@ -247,7 +247,7 @@ NAME                STORE                   REFRESH INTERVAL   STATUS         RE
 tailscale-authkey   vault-cluster-backend   1h                 SecretSynced   True
 ```
 
-![Tailscale Secret Synced](screenshots/phase2b/02-tailscale-secret-synced.png)
+![Tailscale Secret Synced](screenshots/phase2b-tailscale-secret-synced.png)
 
 ### 2b.6 Azure credentials secured in Vault
 
@@ -267,7 +267,7 @@ NAME                STORE                   REFRESH INTERVAL   STATUS         RE
 azure-credentials   vault-cluster-backend   1h                 SecretSynced   True
 ```
 
-![Azure Credentials Synced](screenshots/phase2b/03-azure-credentials-synced.png)
+![Azure Credentials Synced](screenshots/phase2b-azure-credentials-synced.png)
 
 ### 2b.7 Secrets summary — namespace clusters ready
 
@@ -282,15 +282,21 @@ ssh-key             Opaque                           1      1h
 
 All secrets required by the HostedCluster CR are present. **No secret exists in Git.**
 
-![Clusters Namespace Secrets](screenshots/phase2b/04-clusters-secrets-ready.png)
+![Clusters Namespace Secrets](screenshots/phase2b-clusters-secrets-ready.png)
 
 ---
 
 ## Phase 3 — Azure HostedCluster Creation
 
+> **Status**: Hosted Control Plane successfully deployed on OKD SNO. Azure workers
+> provisioning blocked by architectural constraint documented in ADR-001 (see below).
+
 ### 3.1 Azure Service Principal
 
-A dedicated Service Principal `hypershift-azure-sp` was created with `Contributor` role scoped to the subscription. Credentials are stored exclusively in Vault — never in Git or environment files.
+A dedicated Service Principal `hypershift-azure-sp` was created with `Contributor` role
+scoped to the subscription. Credentials are stored exclusively in Vault — never in Git
+or environment files. The SP was immediately rotated after accidental exposure, following
+security best practices.
 
 ```bash
 az ad sp create-for-rbac \
@@ -298,41 +304,48 @@ az ad sp create-for-rbac \
   --role Contributor \
   --scopes /subscriptions/<subscription-id> \
   --output json
-```
 
-![Azure SP Created](screenshots/phase3/01-azure-sp-created.png)
+# Immediate rotation after exposure
+az ad sp credential reset \
+  --id <app-id> \
+  --output json
+```
 
 ### 3.2 Azure Infrastructure — Terraform
 
-Infrastructure is provisioned via Terraform (`infra/azure/`) for reproducibility and clean teardown. No Azure CLI imperative commands in the workflow.
+Infrastructure provisioned via Terraform (`infra/azure/`) for reproducibility and clean
+teardown. No imperative Azure CLI commands in the GitOps workflow.
 
 ```bash
 cd infra/azure
 
-# Credentials injected from Vault — never in files
-export ARM_CLIENT_ID="$(vault kv get -field=client-id secret/hypershift/azure)"
-export ARM_CLIENT_SECRET="$(vault kv get -field=client-secret secret/hypershift/azure)"
-export ARM_TENANT_ID="$(vault kv get -field=tenant-id secret/hypershift/azure)"
-export ARM_SUBSCRIPTION_ID="$(vault kv get -field=subscription-id secret/hypershift/azure)"
+# Credentials injected from Vault via ESO — never in files
+export ARM_CLIENT_ID="$(oc get secret azure-credentials -n clusters \
+  -o jsonpath='{.data.AZURE_CLIENT_ID}' | base64 -d)"
+export ARM_CLIENT_SECRET="$(oc get secret azure-credentials -n clusters \
+  -o jsonpath='{.data.AZURE_CLIENT_SECRET}' | base64 -d)"
+export ARM_TENANT_ID="$(oc get secret azure-credentials -n clusters \
+  -o jsonpath='{.data.AZURE_TENANT_ID}' | base64 -d)"
+export ARM_SUBSCRIPTION_ID="$(oc get secret azure-credentials -n clusters \
+  -o jsonpath='{.data.AZURE_SUBSCRIPTION_ID}' | base64 -d)"
 
 export TF_VAR_subscription_id="$ARM_SUBSCRIPTION_ID"
 export TF_VAR_tenant_id="$ARM_TENANT_ID"
 
 terraform init
-terraform plan
-terraform apply
+terraform apply -auto-approve
 ```
 
 Resources created:
 
-| Resource | Name |
-|----------|------|
-| Resource Group | rg-hypershift-okd-azure-nodepools |
-| Virtual Network | vnet-hypershift (10.0.0.0/16) |
-| Subnet | subnet-workers (10.0.1.0/24) |
-| NSG | nsg-hypershift-workers |
+| Resource | Name | Location |
+|----------|------|----------|
+| Resource Group | rg-hypershift-okd-azure-nodepools | West Europe |
+| Virtual Network | vnet-hypershift (10.0.0.0/16) | West Europe |
+| Subnet | subnet-workers (10.0.1.0/24) | West Europe |
+| NSG | nsg-hypershift-workers | West Europe |
 
-NSG rules — inbound:
+NSG inbound rules:
 
 | Priority | Rule | Protocol | Port | Source |
 |----------|------|----------|------|--------|
@@ -340,29 +353,197 @@ NSG rules — inbound:
 | 110 | AllowHTTPSInbound | TCP | 443 | 100.64.0.0/10 (Tailscale CGNAT) |
 | 120 | AllowSSHDebug | TCP | 22 | 100.64.0.0/10 (Tailscale CGNAT) |
 
-> **📸 Screenshot to add**: `phase3/02-terraform-apply.png` — `terraform apply` output
+![Azure Resource Group](screenshots/phase3-azure-rg-resources.png)
+![NSG Rules](screenshots/phase3-azure-nsg-rules.png)
 
-### 3.3 HostedCluster CR created
+### 3.3 Workload Identities — hypershift create iam azure
 
-> **📸 Screenshot to add**: `phase3/03-hostedcluster-cr.png` — `oc get hostedcluster -n clusters`
+HyperShift Azure requires 7 federated Managed Identities — one per control plane
+component. Created via HyperShift CLI, stored locally — never committed to Git.
 
-### 3.4 Hosted Control Plane pods running on SNO
+```bash
+# Create OIDC issuer endpoint (Azure Blob Storage)
+OIDC_SA_NAME="oidchypershift$(openssl rand -hex 4)"
+az storage account create \
+  --name "$OIDC_SA_NAME" \
+  --resource-group rg-hypershift-okd-azure-nodepools \
+  --location westeurope \
+  --sku Standard_LRS \
+  --allow-blob-public-access true
 
-> **📸 Screenshot to add**: `phase3/04-hcp-pods-running.png` — `oc get pods -n clusters-okd-azure-nodepools`
+az storage container create \
+  --name oidc \
+  --account-name "$OIDC_SA_NAME" \
+  --public-access blob
 
-### 3.5 Azure workers bootstrapping
+OIDC_ISSUER_URL="https://${OIDC_SA_NAME}.blob.core.windows.net/oidc"
 
-> **📸 Screenshot to add**: `phase3/05-azure-vms-provisioning.png` — Azure portal VMs being created
+# Create 7 Managed Identities + federated credentials
+hypershift create iam azure \
+  --azure-creds /tmp/azure-creds.json \
+  --name okd-azure-nodepools \
+  --location westeurope \
+  --resource-group-name rg-hypershift-okd-azure-nodepools \
+  --infra-id okd-azure-nodepools \
+  --oidc-issuer-url "$OIDC_ISSUER_URL" \
+  --output-file /tmp/workload-identities.json
+```
 
-### 3.6 Workers joining via Tailscale
+Managed Identities created:
 
-> **📸 Screenshot to add**: `phase3/06-tailscale-workers-connected.png` — Tailscale dashboard with Azure workers
+| Identity | Component |
+|----------|-----------|
+| okd-azure-nodepools-cloud-provider | azure-cloud-provider |
+| okd-azure-nodepools-disk | cluster-storage-operator-disk |
+| okd-azure-nodepools-file | cluster-storage-operator-file |
+| okd-azure-nodepools-image-registry | cluster-image-registry-operator |
+| okd-azure-nodepools-ingress | cluster-ingress-operator |
+| okd-azure-nodepools-network | cluster-network-operator |
+| okd-azure-nodepools-node-pool-mgmt | cluster-api-provider-azure |
 
-### 3.7 HostedCluster nodes Ready
+![Managed Identities in Azure Portal](screenshots/phase3-azure-managed-identities.png)
 
-> **📸 Screenshot to add**: `phase3/07-hosted-cluster-nodes-ready.png` — `oc get nodes` on hosted cluster
+### 3.4 HostedCluster CR — applied
 
----
+```bash
+hypershift create cluster azure \
+  --name okd-azure-nodepools \
+  --azure-creds /tmp/azure-creds.json \
+  --location westeurope \
+  --resource-group-name rg-hypershift-okd-azure-nodepools \
+  --vnet-id "$VNET_ID" \
+  --subnet-id "$SUBNET_ID" \
+  --network-security-group-id "$NSG_ID" \
+  --base-domain sno.okd.lab \
+  --pull-secret manifests/hypershift/pull-secret.json \
+  --ssh-key ~/.ssh/hypershift_workers.pub \
+  --node-pool-replicas 1 \
+  --instance-type Standard_D4s_v3 \
+  --control-plane-availability-policy SingleReplica \
+  --oidc-issuer-url "$OIDC_ISSUER_URL" \
+  --workload-identities-file /tmp/workload-identities.json \
+  --release-image "quay.io/openshift/okd:4.15.0-0.okd-2024-03-10-010116" \
+  --kas-dns-name api-hypershift.sno.okd.lab
+```
+
+### 3.5 Hosted Control Plane pods — running on SNO
+
+The HyperShift Operator successfully started the Hosted Control Plane components
+as pods on the OKD SNO management cluster:
+
+```
+$ oc get pods -n clusters-okd-azure-nodepools
+NAME                                      READY   STATUS     RESTARTS   AGE
+control-plane-operator-56d896ff4c-n2scz   2/2     Running    0          80s
+cluster-api-5c9f574f4-vhx47               1/1     Running    0          79s
+capi-provider-5c6ff8c588-6v9jl            0/2     Init:0/1   0          79s
+
+$ oc get hostedcluster okd-azure-nodepools -n clusters
+NAME                  PROGRESS   AVAILABLE   PROGRESSING
+okd-azure-nodepools   Partial    False       False
+
+$ oc get nodepool okd-azure-nodepools -n clusters
+NAME                  CLUSTER               DESIRED NODES   AUTOSCALING
+okd-azure-nodepools   okd-azure-nodepools   1               False
+```
+
+**Key insight**: The entire Hosted Control Plane runs as pods on OKD SNO —
+not on Azure. Only the worker nodes (data plane) would run on Azure Spot VMs.
+This is the fundamental HyperShift architecture advantage.
+
+### 3.6 OVN-Kubernetes egress fix
+
+HyperShift Operator pods could not reach `quay.io` due to OVN-Kubernetes
+routing pods via the OVN gateway (no internet route) instead of the host network.
+
+```bash
+# Fix — route pod egress via host network
+oc patch network.operator cluster --type=merge \
+  -p '{"spec":{"defaultNetwork":{"ovnKubernetesConfig":
+       {"gatewayConfig":{"routingViaHost":true}}}}}'
+```
+
+After the OVN pods restart (~2min), pods gained internet access and HyperShift
+successfully pulled the OKD release metadata from `quay.io`.
+
+### 3.7 Architectural constraint — ADR-001
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    ADR-001 — HyperShift Azure LB                    │
+│                                                                     │
+│  CONTEXT                                                            │
+│  HyperShift Azure always creates a public Azure Load Balancer       │
+│  for the kube-apiserver, regardless of --kas-dns-name flag.         │
+│                                                                     │
+│  PROBLEM                                                            │
+│  The LB backend must point to the kube-apiserver pod running        │
+│  on the SNO homelab. The homelab has no public IP                   │
+│  → the LB cannot route traffic to the HCP.                          │
+│                                                                     │
+│  ATTEMPTED SOLUTION                                                 │
+│  --kas-dns-name api-hypershift.sno.okd.lab                          │
+│  → changes DNS name but does NOT change LB publishing strategy      │
+│                                                                     │
+│  CORRECT SOLUTION (future)                                          │
+│  Option A: Expose SNO kube-apiserver via Tailscale Funnel           │
+│            (public HTTPS endpoint via Tailscale infrastructure)     │
+│  Option B: Run HyperShift management cluster on a cloud VM          │
+│            (not homelab) with public IP                             │
+│  Option C: Use OpenShift Hive instead of HyperShift for             │
+│            multi-cluster management from homelab                    │
+│                                                                     │
+│  DECISION                                                           │
+│  Document limitation. Proceed with Hive-based approach in           │
+│  openshift-okd-hive-multicluster-platform repo.                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+```
+ARCHITECTURE — What worked
+════════════════════════════════════════════════════════════════
+
+  OKD SNO (sno-master)
+    │
+    ├── HyperShift Operator          ✅ Running (2 pods)
+    ├── control-plane-operator       ✅ Running
+    ├── cluster-api                  ✅ Running
+    ├── capi-provider                ⏳ Init (waiting for HCP Ready)
+    │
+    └── Hosted Control Plane         ✅ Partially started
+          kube-apiserver             ✅ provisioning
+          etcd                       ✅ provisioning
+          controller-manager         ✅ provisioning
+
+  Azure westeurope
+    ├── Resource Group               ✅ Created via Terraform
+    ├── VNet + Subnet                ✅ Created via Terraform
+    ├── NSG (Tailscale + HTTPS)      ✅ Created via Terraform
+    ├── 7 Managed Identities         ✅ Created via hypershift iam
+    ├── OIDC Storage Account         ✅ Created
+    ├── Load Balancer APIServer      ✅ Created (homelab limitation)
+    └── Workers D4s_v3 Spot         ⏳ Waiting for HCP Ready
+
+  Blocker:
+    LB Azure → SNO homelab (no public IP) ❌
+    Solution: Tailscale Funnel or cloud management cluster
+```
+
+### 3.8 Teardown
+
+```bash
+# Delete HostedCluster + Azure resources
+hypershift destroy cluster azure \
+  --name okd-azure-nodepools \
+  --azure-creds /tmp/azure-creds.json \
+  --resource-group-name rg-hypershift-okd-azure-nodepools
+
+# Delete Terraform infra
+cd infra/azure && terraform destroy -auto-approve
+```
+
+> **Cost for this session**: < $1 total (Azure Spot pricing + LB + Storage Account).
+> All resources destroyed after validation.
 
 ## Phase 4 — Supply Chain Security
 

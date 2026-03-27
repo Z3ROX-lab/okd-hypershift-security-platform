@@ -17,7 +17,7 @@ spec:
     type: Azure
     azure:
       azureAuthenticationConfig:
-        azureAuthenticationConfigType: ManagedIdentity
+        azureAuthenticationConfigType: ManagedIdentities
         armDNSPrefix: okd-azure-nodepools
         cloud: AzurePublicCloud
         credentialsSecretRef:
