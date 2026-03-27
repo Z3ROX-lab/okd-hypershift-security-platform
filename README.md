@@ -11,11 +11,11 @@
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                  OKD SNO — Management Cluster                       │
-│                  sno-master · 192.168.241.10                        │
+│                  sno-master · <sno-master-ip>                       │
 │                                                                     │
 │  ┌─────────────────────┐    ┌──────────────────────────────────┐   │
 │  │   Stack existante   │    │        HyperShift Operator       │   │
-│  │  ✓ Keycloak · Vault │    │      (via MCE in production)     │   │
+│  │  ✓ Keycloak · Vault │    │      standalone (no MCE)         │   │
 │  │  ✓ ArgoCD · ESO     │    └───────────────┬──────────────────┘   │
 │  │  ✓ Grafana · Loki   │                    │                      │
 │  │  ✓ Kyverno          │                    ▼                      │
@@ -29,24 +29,24 @@
 │                                                                     │
 │  ┌──────────────────────────────────────────────────────────────┐  │
 │  │  Tailscale Subnet Router · mTLS · 100.x.x.x                 │  │
-│  └──────────────────────────────┬───────────────────────────────┘  │
-└─────────────────────────────────┼───────────────────────────────────┘
-                                  │ mTLS (Tailscale)
-                    ┌─────────────▼──────────────────┐
-                    │        Azure Workers            │
-                    │        westeurope               │
-                    │                                 │
-                    │  ┌───────────┐  ┌───────────┐  │
-                    │  │ worker-1  │  │ worker-2  │  │
-                    │  │ FCOS      │  │ FCOS      │  │
-                    │  │ D4s_v3    │  │ D4s_v3    │  │
-                    │  │ Spot      │  │ Spot      │  │
-                    │  └───────────┘  └───────────┘  │
-                    │  Cluster Autoscaler: 1 → 5     │
-                    │  Tailscale agent                │
-                    └────────────────────────────────┘
+│  └──────────────────────────┬─────────────────────────────────-┘  │
+└────────────────────────────-┼───────────────────────────────────---┘
+                              │ mTLS (Tailscale WireGuard)
+                ┌─────────────▼──────────────────┐
+                │        Azure Workers            │
+                │        westeurope               │
+                │                                 │
+                │  ┌───────────┐                  │
+                │  │ worker-1  │                  │
+                │  │ FCOS      │                  │
+                │  │ D4s_v3    │                  │
+                │  │ Spot      │                  │
+                │  └───────────┘                  │
+                │  NodePool autoscaling: 1 → 5    │
+                │  Tailscale ephemeral agent       │
+                └────────────────────────────────┘
 
-         Harbor VM · harbor.okd.lab · 192.168.241.20
+         Harbor VM · harbor.okd.lab
          Trivy · Cosign · Supply Chain Security
 ```
 
@@ -54,11 +54,7 @@
 
 ## The HyperShift Model — Control Plane vs Data Plane
 
-HyperShift introduces a fundamental architectural shift compared to a traditional OpenShift/OKD cluster: **the Control Plane and the Data Plane run in completely separate locations**.
-
-### Control Plane — on OKD SNO
-
-The entire Hosted Cluster Control Plane runs as **pods inside the management cluster** (OKD SNO), within a dedicated namespace:
+HyperShift decouples the Control Plane from the Data Plane. The entire Hosted Cluster Control Plane runs as **pods on OKD SNO**, while Azure Spot VMs handle only the data plane.
 
 | Component | Location |
 |---|---|
@@ -66,52 +62,7 @@ The entire Hosted Cluster Control Plane runs as **pods inside the management clu
 | `etcd` | Pod on `sno-master` |
 | `kube-controller-manager` | Pod on `sno-master` |
 | `kube-scheduler` | Pod on `sno-master` |
-| `oauth-server` | Pod on `sno-master` |
-
-This means **multiple hosted clusters can share the same management cluster**, each isolated in its own namespace, with full Control Plane separation.
-
-### Data Plane — on Azure Workers
-
-The Azure VMs run **only the node-level components**. They have no awareness of being part of a "hosted" cluster — they simply register as nodes against a `kube-apiserver` that happens to run as a pod in OKD SNO:
-
-```
-Azure VM                          OKD SNO
-┌─────────────────┐               ┌──────────────────────────┐
-│ FCOS            │               │ pod: kube-apiserver      │
-│ kubelet ────────┼──────────────▶│ pod: etcd                │
-│ CRI-O           │  API calls    │ pod: controller-manager  │
-│ ovn-kube node   │               └──────────────────────────┘
-└─────────────────┘
-```
-
-### How Azure Workers Join the Control Plane
-
-HyperShift uses **Cluster API (CAPI)** with the Azure provider (`cluster-api-provider-azure`) to provision and bootstrap workers automatically:
-
-1. **VM Provisioning** — HyperShift creates Azure VMs (Standard_D4s_v3 Spot) via CAPI
-2. **Ignition Bootstrap** — Each VM receives an Ignition config embedding the `kube-apiserver` endpoint and the node bootstrap token
-3. **FCOS Boot** — The VM boots with Fedora CoreOS, installs `kubelet`, `CRI-O`, and `ovn-kubernetes`
-4. **Node Registration** — `kubelet` contacts the `kube-apiserver` pod running on OKD SNO via Tailscale mTLS
-5. **CSR Approval** — The `kube-controller-manager` (also a pod on SNO) approves the node's Certificate Signing Request
-6. **Node Ready** — The Azure VM appears as a `Ready` node in the Hosted Cluster
-
-The entire bootstrap process is automated by HyperShift's `NodePool` controller. No manual intervention is required.
-
-### Network Path — Tailscale mTLS
-
-The link between the Azure workers and the OKD SNO Control Plane is secured via **Tailscale**:
-
-```
-Azure Worker                 Tailscale Network            OKD SNO
-(100.x.x.x)  ──── mTLS ────────────────────────────  (100.x.x.x)
-                  WireGuard                          Subnet Router
-                  encrypted                         192.168.241.10
-```
-
-- The OKD SNO node runs a **Tailscale Subnet Router**, advertising the `192.168.241.0/24` range
-- Each Azure worker runs a **Tailscale agent**, joining the same tailnet
-- All API traffic between workers and the Hosted Control Plane pods is encrypted via WireGuard (Tailscale's underlying protocol)
-- No public IP is exposed on the Control Plane side
+| Azure Workers | Data plane only — D4s_v3 Spot |
 
 ---
 
@@ -123,21 +74,14 @@ Azure Worker                 Tailscale Network            OKD SNO
 |---|---|---|
 | ArgoCD | GitOps engine — all deployments | ✅ Deployed |
 | Keycloak | OIDC SSO for cluster and applications | ✅ Deployed |
-| HashiCorp Vault | Secrets management | ✅ Deployed |
+| HashiCorp Vault | Secrets management + Kubernetes auth | ✅ Deployed |
 | External Secrets Operator | Vault → Kubernetes secrets sync | ✅ Deployed |
+| ClusterSecretStore | Cross-namespace secrets for HyperShift | ✅ Phase 2b |
 | Grafana + Loki | Observability stack | ✅ Deployed |
 | Kyverno | Policy engine — admission control | ✅ Deployed |
 | GitHub Actions Runner | Self-hosted CI on OKD | ✅ Deployed |
 | HyperShift Operator | Hosted Control Planes manager | ✅ Phase 1 |
 | Tailscale Subnet Router | Secure tunnel to Azure workers | ✅ Phase 2 |
-
-### Harbor VM — 192.168.241.20
-
-| Component | Purpose |
-|---|---|
-| Harbor | Private container registry |
-| Trivy | Image vulnerability scanning |
-| Cosign | Image signing and verification |
 
 ---
 
@@ -145,38 +89,55 @@ Azure Worker                 Tailscale Network            OKD SNO
 
 ### ✅ Phase 1 — HyperShift Operator Installation
 - HyperShift CLI installed from `quay.io/hypershift/hypershift-operator:latest`
-- CRDs patched for Kubernetes 1.28 compatibility (CEL `isIP()` removed)
-- Applied via `--server-side` to bypass 262144 bytes annotation limit
+- CRDs patched for Kubernetes 1.28 compatibility (CEL `isIP()` removed via Python script)
+- Applied via `--server-side --force-conflicts` to bypass 262144 bytes annotation limit
 - Operator running with 2 replicas in namespace `hypershift`
 
 ### ✅ Phase 2 — Tailscale Zero Trust Network
 - Tailscale DaemonSet deployed on `sno-master` (privileged, hostNetwork)
 - Dedicated ServiceAccount + RBAC + SCC `privileged`
-- `sno-master` connected to tailnet: `100.68.211.56`
-- Subnet `192.168.241.0/24` advertised and approved
-- DERP relay: Frankfurt (fra)
+- `sno-master` connected to tailnet with Subnet Router
+- Subnet `<sno-subnet>/24` advertised and approved
+- DERP relay: Frankfurt (fra) — optimal for westeurope Azure region
 
-### 🔜 Phase 3 — Azure HostedCluster Creation
-- Create Azure Service Principal with scoped permissions
-- Deploy `HostedCluster` CR and `NodePool` CR
-- Monitor CAPI provisioning and worker bootstrap
-- Validate node registration via Tailscale mTLS
+### ✅ Phase 2b — Secrets Management (Vault → ESO → Kubernetes)
+- Vault Kubernetes auth backend enabled and configured with OKD SNO CA cert
+- Vault policies + roles created (least-privilege): `keycloak`, `grafana`, `eso-hypershift`
+- ESO SecretStores fixed: `keycloak` + `grafana-operator` → `Valid/Ready`
+- ExternalSecrets synced: `keycloak-secrets` + `grafana-prometheus-token` → `SecretSynced`
+- `ClusterSecretStore vault-cluster-backend` created (cross-namespace for HyperShift)
+- Tailscale auth key secured: `Vault KV → ESO → K8s Secret (namespace clusters)`
+- Azure SP credentials secured: `Vault KV → ESO → K8s Secret (namespace clusters)`
+- **No secrets in Git** — all credentials managed via Vault + ESO
+
+### ✅ Phase 3 — Azure HostedCluster Creation (partial)
+- Azure Service Principal created with `Contributor` role + immediate credential rotation
+- Azure infrastructure provisioned via **Terraform** (`infra/azure/`):
+  - VNet, Subnet, NSG (Tailscale UDP 41641 + HTTPS TCP 443)
+- 7 Workload Identity Managed Identities created via `hypershift create iam azure`
+- OIDC issuer endpoint deployed on Azure Blob Storage
+- HostedCluster CR applied → HCP pods started on SNO:
+  - `control-plane-operator` ✅ Running
+  - `cluster-api` ✅ Running
+  - `capi-provider` ⏳ Init (blocked — see ADR-001)
+- OVN-Kubernetes egress fix: `routingViaHost: true` (pods → internet access)
+- **ADR-001**: HyperShift Azure requires public LB for kube-apiserver —
+  incompatible with homelab (no public IP). See `docs/adr/ADR-001-hypershift-azure-lb.md`
 
 ### 🔜 Phase 4 — Supply Chain Security
 - Configure Harbor as pull-through cache for Hosted Cluster images
-- Enforce Cosign signature verification via Kyverno policies on the Hosted Cluster
-- Integrate Trivy scanning in the GitHub Actions CI pipeline
+- Enforce Cosign signature verification via Kyverno on the Hosted Cluster
+- Integrate Trivy scanning in GitHub Actions CI pipeline
 
 ### 🔜 Phase 5 — Observability & IAM
 - Extend Prometheus/Grafana to scrape Hosted Cluster metrics
-- Federate Loki logs from Azure workers to OKD SNO Loki
+- Federate Loki logs from Azure workers to OKD SNO
 - Configure Keycloak OIDC for Hosted Cluster API authentication
-- Integrate Vault for Hosted Cluster secrets
 
-### 🔜 Phase 6 — Documentation & Security Posture
-- Architecture Decision Records (ADRs) for each design choice
-- `SECURITY.md` covering IAM, supply chain, network, runtime, secrets
-- Threat model: attack surface analysis (HCP pods ↔ Azure workers link)
+### 🔜 Phase 6 — Tailscale Funnel (ADR-001 resolution)
+- Expose HCP kube-apiserver via Tailscale Funnel (public HTTPS endpoint)
+- Eliminates need for Azure public Load Balancer
+- Workers join HCP via Tailscale — Zero Trust end-to-end
 
 ---
 
@@ -186,30 +147,39 @@ Azure Worker                 Tailscale Network            OKD SNO
 okd-hypershift-security-platform/
 ├── argocd/
 │   └── applications/
+│       └── eso-hypershift.yaml         # ClusterSecretStore ArgoCD app
+├── infra/
+│   └── azure/                          # Terraform — Azure network infra
+│       ├── main.tf
+│       ├── variables.tf
+│       ├── outputs.tf
+│       ├── versions.tf
+│       └── README.md
 ├── manifests/
+│   ├── eso/
+│   │   ├── cluster-secret-store.yaml
+│   │   ├── externalsecret-tailscale.yaml
+│   │   └── externalsecret-azure.yaml
 │   ├── hypershift/
-│   │   └── hypershift-install-patched.yaml
+│   │   ├── hypershift-install-patched.yaml
+│   │   ├── hosted-cluster.yaml
+│   │   └── nodepool.yaml
 │   └── tailscale/
 │       └── daemonset-sno.yaml
+├── scripts/
+│   └── deploy-hostedcluster.sh         # Injects secrets from ESO at deploy time
 ├── docs/
 │   ├── architecture/
 │   │   └── architecture-overview.svg
 │   ├── demo/
 │   │   ├── DEMO.md
-│   │   └── screenshots/
-│   │       ├── architecture-overview.png
-│   │       ├── phase1/
-│   │       └── phase2/
-│   └── adr/
+│   │   └── screenshots/                # Flat structure — no subdirectories
+│   ├── adr/
+│   │   └── ADR-001-hypershift-azure-lb.md
+│   └── phase2b-secrets-hypershift.md
 ├── SECURITY.md
 └── README.md
 ```
-
----
-
-## Demo Walkthrough
-
-A full step-by-step demo with screenshots is available in [`docs/demo/DEMO.md`](docs/demo/DEMO.md).
 
 ---
 
@@ -219,32 +189,20 @@ A full step-by-step demo with screenshots is available in [`docs/demo/DEMO.md`](
 |---|---|
 | HyperShift CEL `isIP()` incompatible with k8s 1.28 | Python script to patch CRDs before apply |
 | CRD too large for client-side apply (>262144 bytes) | `--server-side --force-conflicts` apply |
-| MCE not available on OKD (Red Hat subscription required) | HyperShift standalone operator via CLI |
+| MCE not available on OKD | HyperShift standalone operator via CLI |
 | Tailscale DNS resolution fails with `hostNetwork: true` | `dnsPolicy: ClusterFirstWithHostNet` |
 | Tailscale pod rejected by OKD PodSecurity | Dedicated ServiceAccount + SCC `privileged` |
+| Vault Kubernetes auth not enabled | `vault auth enable kubernetes` + CA cert config |
+| ESO `403 permission denied` on SecretStores | Role bound to `cluster-external-secrets` SA |
+| OVN-Kubernetes pods no internet egress | `routingViaHost: true` patch on network.operator |
+| HyperShift Azure always creates public LB | ADR-001 — Tailscale Funnel planned (Phase 6) |
+| Azure SP credentials exposed | Immediate rotation via `az ad sp credential reset` |
 
 ---
 
-## Key Design Decisions
+## Demo Walkthrough
 
-**Why HyperShift instead of a standalone cluster?**
-HyperShift allows running the entire Control Plane as pods on the management cluster, drastically reducing the infrastructure footprint. A full OKD cluster requires 3 control plane nodes (minimum). With HyperShift, control plane components consume shared resources on OKD SNO, while Azure Spot VMs handle only the data plane — reducing costs by ~60% compared to a traditional cluster.
-
-**Why Azure Spot instances?**
-For a lab environment, Spot pricing reduces compute costs by up to 80% versus on-demand. The `NodePool` autoscaler handles evictions gracefully by re-provisioning workers. The Control Plane, running as pods on SNO, is unaffected by Azure eviction events.
-
-**Why Tailscale for the worker-to-CP link?**
-The Hosted Control Plane pods are not publicly exposed. Tailscale provides a Zero Trust overlay network with WireGuard encryption, ensuring the only external attack surface is the authenticated, encrypted tunnel between workers and the SNO subnet router.
-
----
-
-## Prerequisites
-
-- OKD SNO 4.15 cluster running and accessible
-- Azure subscription with Contributor role
-- Tailscale account (free tier sufficient)
-- `oc` CLI, `hypershift` CLI, `az` CLI
-- GitHub repository access for GitOps
+A full step-by-step demo with screenshots is available in [`docs/demo/DEMO.md`](docs/demo/DEMO.md).
 
 ---
 
