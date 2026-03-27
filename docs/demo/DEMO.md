@@ -19,9 +19,9 @@ The only external attack surface is the link between the Hosted Control Plane po
 
 | Component | Details |
 |---|---|
-| Management Cluster | OKD SNO 4.15 — `sno-master` (192.168.241.10) |
+| Management Cluster | OKD SNO 4.15 — `sno-master` (<sno-master-ip>) |
 | Hypervisor | VMware Workstation Pro — GEEKOM A6 (Ryzen 6900HX, 32GB DDR5) |
-| Harbor VM | harbor.okd.lab — 192.168.241.20 |
+| Harbor VM | harbor.okd.lab — <harbor-ip> |
 | Azure Region | westeurope |
 | Worker type | Standard_D4s_v3 Spot |
 | Autoscaling | 1 → 5 nodes |
@@ -40,7 +40,7 @@ sno-master   Ready    control-plane,master,worker   15d   v1.28.2
 ```
 
 ```bash
-$ oc get applications -n argocd
+$ oc get applications -n openshift-operators
 NAME             SYNC STATUS   HEALTH STATUS
 eso              Synced        Healthy
 grafana          Synced        Healthy
@@ -127,13 +127,13 @@ The Hosted Control Plane pods on OKD SNO need to communicate with Azure worker n
 - **No public IP on SNO** — the management cluster is never directly exposed
 
 ```
-Azure Worker (100.x.x.x) ──── WireGuard ──── sno-master (100.68.211.56)
-                                mTLS           Subnet Router 192.168.241.0/24
+Azure Worker (100.x.x.x) ──── WireGuard ──── sno-master (<sno-tailscale-ip>)
+                                mTLS           Subnet Router <sno-subnet>/24
 ```
 
 ### 2.2 Tailscale Auth Keys
 
-![Tailscale Auth Keys](screenshots/phase2/01-tailscale-authkeys.png)
+> ⚠️ Screenshot omitted — contains sensitive auth key material.
 
 Two auth keys configured:
 - **Reusable + Pre-approved** → for `sno-master` (permanent node)
@@ -149,7 +149,7 @@ Tailscale is deployed as a privileged DaemonSet on OKD SNO. Key design decisions
 | `dnsPolicy` | `ClusterFirstWithHostNet` | Resolve `kubernetes.default.svc` with CoreDNS |
 | `serviceAccountName` | `tailscale` | Dedicated SA with RBAC to read/write Secrets |
 | `SCC` | `privileged` | OpenShift requires explicit SCC grant for privileged pods |
-| `TS_ROUTES` | `192.168.241.0/24` | Advertise OKD SNO subnet to Tailscale network |
+| `TS_ROUTES` | `<sno-subnet>/24` | Advertise OKD SNO subnet to Tailscale network |
 
 ```bash
 $ oc get pods -n tailscale
@@ -161,46 +161,206 @@ tailscale-ktjhs   1/1     Running   0          2d
 
 ### 2.4 sno-master connected to Tailscale network
 
-![Tailscale Dashboard — sno-master connected](screenshots/phase2/02-tailscale-dashboard-sno-master-connected.png)
+> ⚠️ Screenshot omitted — contains account email and Tailscale IP.
 
-`sno-master` is connected with IP **100.68.211.56**, advertising subnet `192.168.241.0/24` (approved). DERP relay: Frankfurt (fra) — optimal for westeurope Azure region.
+`sno-master` is connected with IP **<sno-tailscale-ip>**, advertising subnet `<sno-subnet>/24` (approved). DERP relay: Frankfurt (fra) — optimal for westeurope Azure region.
 
 ```bash
 $ oc exec -n tailscale daemonset/tailscale -- tailscale status
-100.68.211.56   sno-master   stefilou1971@   linux   -
+<sno-tailscale-ip>   sno-master   <tailscale-account>@   linux   -
 ```
 
-![Tailscale Status CLI](screenshots/phase2/04-tailscale-status-cli.png)
+> ⚠️ Screenshot omitted — contains account email and Tailscale IP.
+
+---
+
+## Phase 2b — Secrets Management (Vault → ESO → Kubernetes)
+
+> All sensitive credentials are managed through a secure chain: HashiCorp Vault → External Secrets Operator → Kubernetes Secrets. No secrets are ever stored in Git.
+
+### 2b.1 Vault Kubernetes Auth Backend
+
+The Vault Kubernetes auth backend was configured to allow ESO to authenticate using its ServiceAccount JWT token, validated against the OKD SNO API server CA certificate.
+
+```bash
+# Enable Kubernetes auth
+vault auth enable kubernetes
+
+# Configure with OKD SNO CA and token reviewer
+vault write auth/kubernetes/config \
+  kubernetes_host="https://kubernetes.default.svc:443" \
+  kubernetes_ca_cert=@/var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
+  token_reviewer_jwt="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+```
+
+**Root cause fixed**: The Vault Kubernetes auth backend was not enabled — ESO SecretStores were returning `403 permission denied` on all namespaces.
+
+### 2b.2 Vault Policies and Roles
+
+Three policies and roles created for least-privilege access:
+
+| Role | ServiceAccount | Namespace | Policies |
+|------|---------------|-----------|----------|
+| `keycloak` | `cluster-external-secrets` | `external-secrets` | `keycloak-policy` |
+| `grafana` | `cluster-external-secrets` | `external-secrets` | `grafana-policy` |
+| `eso-hypershift` | `cluster-external-secrets` | `external-secrets` | `keycloak-policy`, `grafana-policy`, `hypershift-policy` |
+
+### 2b.3 ESO SecretStores — all healthy
+
+```bash
+$ oc get secretstore -A
+NAMESPACE          NAME            STATUS   CAPABILITIES   READY
+grafana-operator   vault-backend   Valid    ReadWrite      True
+keycloak           vault-backend   Valid    ReadWrite      True
+
+$ oc get externalsecret -A
+NAMESPACE          NAME                       STATUS         READY
+grafana-operator   grafana-prometheus-token   SecretSynced   True
+keycloak           keycloak-secrets           SecretSynced   True
+```
+
+![ESO SecretStores Ready](screenshots/phase2b/01-eso-secretstores-ready.png)
+
+### 2b.4 ClusterSecretStore — cross-namespace for HyperShift
+
+A `ClusterSecretStore` (cluster-scoped) was created to allow the dynamically-created `clusters` namespace to consume secrets from Vault without a per-namespace SecretStore.
+
+```bash
+$ oc get clustersecretstore
+NAME                    AGE   STATUS   CAPABILITIES   READY
+vault-cluster-backend   1h    Valid    ReadWrite      True
+```
+
+Managed via ArgoCD (`eso-hypershift` application) from the Airgap repo — GitOps compliant.
+
+### 2b.5 Tailscale auth key secured in Vault
+
+```
+Vault KV: secret/hypershift/tailscale.auth-key
+  → ESO ExternalSecret (namespace: clusters)
+  → K8s Secret: tailscale-authkey
+```
+
+```bash
+$ oc get externalsecret tailscale-authkey -n clusters
+NAME                STORE                   REFRESH INTERVAL   STATUS         READY
+tailscale-authkey   vault-cluster-backend   1h                 SecretSynced   True
+```
+
+![Tailscale Secret Synced](screenshots/phase2b/02-tailscale-secret-synced.png)
+
+### 2b.6 Azure credentials secured in Vault
+
+```
+Vault KV: secret/hypershift/azure
+  ├── client-id
+  ├── client-secret
+  ├── tenant-id
+  └── subscription-id
+  → ESO ExternalSecret (namespace: clusters)
+  → K8s Secret: azure-credentials (4 keys)
+```
+
+```bash
+$ oc get externalsecret azure-credentials -n clusters
+NAME                STORE                   REFRESH INTERVAL   STATUS         READY
+azure-credentials   vault-cluster-backend   1h                 SecretSynced   True
+```
+
+![Azure Credentials Synced](screenshots/phase2b/03-azure-credentials-synced.png)
+
+### 2b.7 Secrets summary — namespace clusters ready
+
+```bash
+$ oc get secrets -n clusters
+NAME                TYPE                             DATA   AGE
+tailscale-authkey   Opaque                           1      4h
+azure-credentials   Opaque                           4      1h
+pull-secret         kubernetes.io/dockerconfigjson   1      1h
+ssh-key             Opaque                           1      1h
+```
+
+All secrets required by the HostedCluster CR are present. **No secret exists in Git.**
+
+![Clusters Namespace Secrets](screenshots/phase2b/04-clusters-secrets-ready.png)
 
 ---
 
 ## Phase 3 — Azure HostedCluster Creation
 
-> 🚧 **In progress**
-
 ### 3.1 Azure Service Principal
 
-> **📸 Screenshot to add**: `phase3/01-azure-sp-created.png` — Service Principal creation output
+A dedicated Service Principal `hypershift-azure-sp` was created with `Contributor` role scoped to the subscription. Credentials are stored exclusively in Vault — never in Git or environment files.
 
-### 3.2 HostedCluster CR created
+```bash
+az ad sp create-for-rbac \
+  --name "hypershift-azure-sp" \
+  --role Contributor \
+  --scopes /subscriptions/<subscription-id> \
+  --output json
+```
 
-> **📸 Screenshot to add**: `phase3/02-hostedcluster-cr.png` — `oc get hostedcluster -n clusters`
+![Azure SP Created](screenshots/phase3/01-azure-sp-created.png)
 
-### 3.3 Hosted Control Plane pods running on SNO
+### 3.2 Azure Infrastructure — Terraform
 
-> **📸 Screenshot to add**: `phase3/03-hcp-pods-running.png` — `oc get pods -n clusters-hosted-1`
+Infrastructure is provisioned via Terraform (`infra/azure/`) for reproducibility and clean teardown. No Azure CLI imperative commands in the workflow.
 
-### 3.4 Azure workers bootstrapping
+```bash
+cd infra/azure
 
-> **📸 Screenshot to add**: `phase3/04-azure-vms-provisioning.png` — Azure portal VMs being created
+# Credentials injected from Vault — never in files
+export ARM_CLIENT_ID="$(vault kv get -field=client-id secret/hypershift/azure)"
+export ARM_CLIENT_SECRET="$(vault kv get -field=client-secret secret/hypershift/azure)"
+export ARM_TENANT_ID="$(vault kv get -field=tenant-id secret/hypershift/azure)"
+export ARM_SUBSCRIPTION_ID="$(vault kv get -field=subscription-id secret/hypershift/azure)"
 
-### 3.5 Workers joining via Tailscale
+export TF_VAR_subscription_id="$ARM_SUBSCRIPTION_ID"
+export TF_VAR_tenant_id="$ARM_TENANT_ID"
 
-> **📸 Screenshot to add**: `phase3/05-tailscale-workers-connected.png` — Tailscale dashboard with Azure workers
+terraform init
+terraform plan
+terraform apply
+```
 
-### 3.6 HostedCluster nodes Ready
+Resources created:
 
-> **📸 Screenshot to add**: `phase3/06-hosted-cluster-nodes-ready.png` — `oc get nodes` on hosted cluster
+| Resource | Name |
+|----------|------|
+| Resource Group | rg-hypershift-okd-azure-nodepools |
+| Virtual Network | vnet-hypershift (10.0.0.0/16) |
+| Subnet | subnet-workers (10.0.1.0/24) |
+| NSG | nsg-hypershift-workers |
+
+NSG rules — inbound:
+
+| Priority | Rule | Protocol | Port | Source |
+|----------|------|----------|------|--------|
+| 100 | AllowTailscaleInbound | UDP | 41641 | * |
+| 110 | AllowHTTPSInbound | TCP | 443 | 100.64.0.0/10 (Tailscale CGNAT) |
+| 120 | AllowSSHDebug | TCP | 22 | 100.64.0.0/10 (Tailscale CGNAT) |
+
+> **📸 Screenshot to add**: `phase3/02-terraform-apply.png` — `terraform apply` output
+
+### 3.3 HostedCluster CR created
+
+> **📸 Screenshot to add**: `phase3/03-hostedcluster-cr.png` — `oc get hostedcluster -n clusters`
+
+### 3.4 Hosted Control Plane pods running on SNO
+
+> **📸 Screenshot to add**: `phase3/04-hcp-pods-running.png` — `oc get pods -n clusters-okd-azure-nodepools`
+
+### 3.5 Azure workers bootstrapping
+
+> **📸 Screenshot to add**: `phase3/05-azure-vms-provisioning.png` — Azure portal VMs being created
+
+### 3.6 Workers joining via Tailscale
+
+> **📸 Screenshot to add**: `phase3/06-tailscale-workers-connected.png` — Tailscale dashboard with Azure workers
+
+### 3.7 HostedCluster nodes Ready
+
+> **📸 Screenshot to add**: `phase3/07-hosted-cluster-nodes-ready.png` — `oc get nodes` on hosted cluster
 
 ---
 
@@ -250,13 +410,16 @@ $ oc exec -n tailscale daemonset/tailscale -- tailscale status
 |---|---|---|
 | Network | Tailscale WireGuard mTLS | ✅ Phase 2 |
 | Network | Zero Trust — no public CP endpoint | ✅ Phase 2 |
-| Secrets | HashiCorp Vault | ✅ Deployed |
+| Secrets | HashiCorp Vault + ESO | ✅ Phase 2b |
+| Secrets | No secrets in Git | ✅ Phase 2b |
 | IAM | Keycloak OIDC SSO | ✅ Deployed |
+| IAM | Vault Kubernetes auth — least privilege | ✅ Phase 2b |
 | Supply Chain | Harbor + Trivy image scanning | 🔜 Phase 4 |
 | Supply Chain | Cosign image signing | 🔜 Phase 4 |
 | Policy | Kyverno admission control | ✅ Deployed |
 | Observability | Prometheus + Grafana + Loki | ✅ Deployed |
 | GitOps | ArgoCD — all deployments | ✅ Deployed |
+| IaC | Terraform — Azure infra | ✅ Phase 3 |
 | Cost | Azure budget alert $50/month | ✅ Phase 1 |
 
 ---
@@ -270,6 +433,10 @@ $ oc exec -n tailscale daemonset/tailscale -- tailscale status
 | Tailscale pod DNS resolution with `hostNetwork: true` | `dnsPolicy: ClusterFirstWithHostNet` |
 | Tailscale pod rejected by OKD PodSecurity | Dedicated ServiceAccount + SCC `privileged` |
 | MCE not available on OKD (Red Hat subscription required) | HyperShift standalone operator via CLI |
+| Vault Kubernetes auth backend not enabled | `vault auth enable kubernetes` + CA cert config |
+| ESO `403 permission denied` on all SecretStores | Role bound to `cluster-external-secrets` SA (ESO's actual SA) |
+| HyperShift Azure requires full resource IDs | Terraform outputs provide exact `/subscriptions/.../` paths |
+| Azure SP credentials exposed in chat history | Immediate credential rotation via `az ad sp credential reset` |
 
 ---
 
@@ -277,14 +444,29 @@ $ oc exec -n tailscale daemonset/tailscale -- tailscale status
 
 ```
 okd-hypershift-security-platform/
-├── argocd/applications/
+├── argocd/
+│   └── applications/
+│       └── eso-hypershift.yaml         # ClusterSecretStore ArgoCD app
+├── infra/
+│   └── azure/                          # Terraform — Azure network infra
+│       ├── versions.tf
+│       ├── variables.tf
+│       ├── main.tf
+│       ├── outputs.tf
+│       └── README.md
 ├── manifests/
+│   ├── eso/
+│   │   ├── cluster-secret-store.yaml   # ClusterSecretStore (ref only)
+│   │   ├── externalsecret-tailscale.yaml
+│   │   └── externalsecret-azure.yaml
 │   ├── hypershift/
-│   │   └── hypershift-install-patched.yaml
+│   │   ├── hypershift-install-patched.yaml
+│   │   ├── hosted-cluster.yaml         # HostedCluster CR
+│   │   └── nodepool.yaml               # NodePool CR (1x D4s_v3 Spot)
 │   └── tailscale/
 │       └── daemonset-sno.yaml
 ├── docs/
-│   ├── architecture/
+│   ├── phase2b-secrets-hypershift.md
 │   └── demo/
 │       ├── DEMO.md
 │       └── screenshots/
