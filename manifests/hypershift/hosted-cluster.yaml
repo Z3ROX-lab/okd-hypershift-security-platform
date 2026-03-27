@@ -2,6 +2,10 @@
 # hosted-cluster.yaml — HostedCluster CR HyperShift Azure
 # Repo : okd-hypershift-security-platform
 # Namespace : clusters
+# Infrastructure Azure provisionnée via Terraform (infra/azure/)
+#
+# ⚠️  Ne pas appliquer directement — utiliser deploy.sh
+#     qui injecte les variables depuis Vault/ESO
 # =============================================================================
 apiVersion: hypershift.openshift.io/v1beta1
 kind: HostedCluster
@@ -17,21 +21,22 @@ spec:
   platform:
     type: Azure
     azure:
-      credentials:
-        name: azure-credentials    # ExternalSecret → Vault secret/hypershift/azure
+      azureAuthenticationConfig:
+        armDNSPrefix: okd-azure-nodepools
+        cloud: AzurePublicCloud
+        credentialsSecretRef:
+          name: azure-credentials
+          namespace: clusters
       location: westeurope
-      resourceGroupName: rg-hypershift-okd-azure-nodepools
-      subscriptionID: ba0b95a5-9b7c-42f1-9be5-60693af5e24f
-      tenantID: 50f175e8-570e-41d1-9759-735e9ad3a14e
-      vnetName: vnet-hypershift
-      subnetName: subnet-workers
-      securityGroupName: nsg-hypershift-workers
-      machineIdentityID: ""        # à remplir après création du SP managed identity si nécessaire
+      resourceGroup: ${AZURE_RESOURCE_GROUP}
+      subscriptionID: ${AZURE_SUBSCRIPTION_ID}
+      tenantID: ${AZURE_TENANT_ID}
+      vnetID: ${AZURE_VNET_ID}
+      subnetID: ${AZURE_SUBNET_ID}
+      securityGroupID: ${AZURE_NSG_ID}
 
   dns:
     baseDomain: sno.okd.lab
-    publicZoneID: ""
-    privateZoneID: ""
 
   networking:
     clusterNetwork:
@@ -39,14 +44,14 @@ spec:
     serviceNetwork:
       - cidr: 172.31.0.0/16
     machineNetwork:
-      - cidr: 10.0.0.0/16          # CIDR du subnet Azure workers
+      - cidr: 10.0.0.0/16
     networkType: OVNKubernetes
 
   pullSecret:
-    name: pull-secret              # Secret avec pull secret OKD (peut être fake pour OKD)
+    name: pull-secret
 
   sshKey:
-    name: ssh-key                  # Secret avec clé publique SSH pour les workers
+    name: ssh-key
 
   infraID: okd-azure-nodepools
 
