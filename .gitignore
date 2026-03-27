@@ -1,0 +1,7 @@
+
+# Terraform
+infra/azure/.terraform/
+infra/azure/.terraform.lock.hcl
+infra/azure/*.tfstate
+infra/azure/*.tfstate.backup
+infra/azure/*.tfvars
